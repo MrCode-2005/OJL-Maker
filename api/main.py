@@ -1,6 +1,9 @@
-import io
 import os
 import sys
+# Add parent directory to path so we can import gemini_helper and pdf_filler
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import io
 import uuid
 import threading
 import tempfile
@@ -12,14 +15,12 @@ from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.middleware import Middleware
-from starlette.requests import Request
 from pydantic import BaseModel
 from dateutil.parser import parse as parse_date
 import PyPDF2
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from gemini_helper import split_work_into_days, generate_journal_entry, generate_all_journals
+from gemini_helper import parse_structured_entry, parse_multi_day_text
 from pdf_filler import fill_pdf_with_overlay
 
 # Set temp directory for Vercel
@@ -28,21 +29,13 @@ if 'VERCEL' in os.environ:
 
 app = FastAPI(title="OJT Journal Maker")
 
-# Configure for larger uploads (100MB limit)
+# Configure for larger uploads (50MB limit)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-# Custom middleware to handle large payloads
-@app.middleware("http")
-async def add_max_body_size(request: Request, call_next):
-    # This allows up to 100MB request bodies
-    # Vercel's limit is handled via the 3GB memory setting
-    return await call_next(request)
 
 # Error handler for large uploads
 @app.exception_handler(StarletteHTTPException)
@@ -81,8 +74,8 @@ def cleanup_old_tasks():
 # Helper utilities
 # ---------------------------------------------------------------------------
 
-def get_working_days(start: datetime, end: datetime, skip: list) -> list:
-    """Return list of date strings (YYYY-MM-DD) for Mon-Fri between start and end, excluding skip."""
+def get_working_days(start: datetime, end: datetime, skip: list, include_saturdays: bool = False, include_sundays: bool = False) -> list:
+    """Return list of date strings (YYYY-MM-DD) between start and end, optionally including weekends, excluding skip."""
     skip_set = set()
     for s in skip:
         s = s.strip()
@@ -96,7 +89,15 @@ def get_working_days(start: datetime, end: datetime, skip: list) -> list:
     current = start.date()
     end_date = end.date()
     while current <= end_date:
-        if current.weekday() < 5 and current not in skip_set:
+        weekday = current.weekday()
+        # Monday=0, Sunday=6
+        is_weekend = False
+        if weekday == 5 and not include_saturdays:
+            is_weekend = True
+        elif weekday == 6 and not include_sundays:
+            is_weekend = True
+            
+        if not is_weekend and current not in skip_set:
             days.append(current.strftime("%Y-%m-%d"))
         current += timedelta(days=1)
     return days
@@ -106,7 +107,7 @@ def get_working_days(start: datetime, end: datetime, skip: list) -> list:
 # Background task
 # ---------------------------------------------------------------------------
 
-def generate_pdf_background(task_id: str, api_key: str):
+def generate_pdf_background(task_id: str):
     """Background thread: generate all journal entries and fill PDF."""
     task = tasks.get(task_id)
     if not task:
@@ -120,20 +121,32 @@ def generate_pdf_background(task_id: str, api_key: str):
         ojt_timing = task["ojt_timing"]
         department = task["department"]
         designation = task["designation"]
+        user_details = task.get("user_details", {})
+        journal_start_page = task.get("journal_start_page", 8)
+        journal_end_page = task.get("journal_end_page")
         total = len(daily_work)
 
-        # STEP 1: Generate ALL entries in ONE API call
-        task["message"] = "Generating all journal entries..."
-        print(f"[Task {task_id}] Generating all entries in one call...")
+        # Try parsing structured text directly (NO AI call)
+        task["message"] = "Parsing your entries..."
+        print(f"[Task {task_id}] Trying to parse structured text from user input...")
 
-        try:
-            all_entries = generate_all_journals(api_key, daily_work)
-            print(f"[Task {task_id}] All entries generated successfully")
-        except Exception as exc:
-            print(f"[Task {task_id}] ERROR (batch): {exc}")
-            print(traceback.format_exc())
+        all_entries = []
+        all_parsed = True
 
-            # fallback: create basic entries
+        for day_item in daily_work:
+            parsed = parse_structured_entry(day_item.get("work", ""))
+            if parsed:
+                all_entries.append(parsed)
+            else:
+                all_parsed = False
+                break
+
+        if all_parsed and len(all_entries) == len(daily_work):
+            print(f"[Task {task_id}] All {len(all_entries)} entries parsed directly from user text")
+        else:
+            task["message"] = "Creating basic entries..."
+            print(f"[Task {task_id}] Structured parsing failed, creating basic entries from raw text...")
+            # Fallback: create basic entries from raw work text
             all_entries = []
             for day_item in daily_work:
                 all_entries.append({
@@ -141,7 +154,7 @@ def generate_pdf_background(task_id: str, api_key: str):
                     "tasks_carried_out": day_item["work"],
                     "key_learnings": "Gained practical experience.",
                     "tools_used": "Various tools",
-                    "special_achievements": "N/A",
+                    "special_achievements": "",
                 })
 
         # STEP 2: Build pages_data locally (NO API CALLS HERE)
@@ -169,7 +182,11 @@ def generate_pdf_background(task_id: str, api_key: str):
 
         task["message"] = "Filling PDF template..."
         print(f"[Task {task_id}] {task['message']}")
-        filled_pdf = fill_pdf_with_overlay(pdf_bytes, pages_data)
+        filled_pdf = fill_pdf_with_overlay(
+            pdf_bytes, pages_data, user_details,
+            journal_start_page=journal_start_page,
+            journal_end_page=journal_end_page
+        )
         print(f"[Task {task_id}] PDF filled successfully")
 
         # Write to a temp file
@@ -197,7 +214,6 @@ def generate_pdf_background(task_id: str, api_key: str):
 
 class GenerateRequest(BaseModel):
     task_id: str
-    api_key: str
     daily_work: list  # [{day, date, work}, ...]
 
 
@@ -211,11 +227,22 @@ async def upload(
     start_date: str = Form(...),
     end_date: str = Form(...),
     skip_dates: str = Form(""),
+    include_saturdays: str = Form("false"),
+    include_sundays: str = Form("false"),
     ojt_timing: str = Form(...),
     department: str = Form(...),
     designation: str = Form(...),
+    name: str = Form(default=""),
+    registration_number: str = Form(default=""),
+    program_name: str = Form(default=""),
+    semester: str = Form(default=""),
+    location: str = Form(default=""),
+    industry_partner_name: str = Form(default=""),
+    phone_no: str = Form(default=""),
+    email_id: str = Form(default=""),
+    journal_page_type: str = Form(default="all"),
+    journal_custom_range: str = Form(default=""),
     work_description: str = Form(...),
-    api_key: str = Form(...),
 ):
     # Opportunistically clean up old tasks on each upload
     cleanup_old_tasks()
@@ -228,7 +255,10 @@ async def upload(
             return JSONResponse(status_code=400, content={"error": "end_date must be after start_date"})
 
         skip_list = [s.strip() for s in skip_dates.split(",") if s.strip()] if skip_dates else []
-        working_days = get_working_days(start_dt, end_dt, skip_list)
+        inc_sat = (include_saturdays.lower() == "true")
+        inc_sun = (include_sundays.lower() == "true")
+        
+        working_days = get_working_days(start_dt, end_dt, skip_list, include_saturdays=inc_sat, include_sundays=inc_sun)
 
         if not working_days:
             return JSONResponse(status_code=400, content={"error": "No working days found in the given range."})
@@ -258,8 +288,24 @@ async def upload(
                 },
             )
 
-        # Split work into days via Gemini
-        daily_work = split_work_into_days(api_key, work_description, working_days, num_days)
+        # Parse journal pages
+        journal_start_page = 8
+        journal_end_page = None
+        if journal_page_type == "custom" and journal_custom_range:
+            parts = journal_custom_range.split("-")
+            try:
+                journal_start_page = int(parts[0].strip())
+                if len(parts) > 1 and parts[1].strip():
+                    journal_end_page = int(parts[1].strip())
+            except ValueError:
+                pass
+
+        # Try parsing structured multi-day text first (no AI needed)
+        daily_work = parse_multi_day_text(work_description, working_days, num_days)
+        if daily_work:
+            print(f"[Upload] Parsed {len(daily_work)} days directly from structured text (no AI)")
+        else:
+            return JSONResponse(status_code=400, content={"error": "The provided text does not follow the required Markdown structure. Please click the 'Copy Example Format' button and format your text."})
 
         task_id = str(uuid.uuid4())
         tasks[task_id] = {
@@ -270,6 +316,19 @@ async def upload(
             "ojt_timing": ojt_timing,
             "department": department,
             "designation": designation,
+            "user_details": {
+                "name": name,
+                "registration_number": registration_number,
+                "start_date": start_date,
+                "program_name": program_name,
+                "semester": semester,
+                "location": location,
+                "industry_partner_name": industry_partner_name,
+                "phone_no": phone_no,
+                "email_id": email_id,
+            },
+            "journal_start_page": journal_start_page,
+            "journal_end_page": journal_end_page,
             "progress": 0,
             "total_pages": num_days,
             "current_page": 0,
@@ -306,7 +365,7 @@ async def generate(req: GenerateRequest):
 
     thread = threading.Thread(
         target=generate_pdf_background,
-        args=(req.task_id, req.api_key),
+        args=(req.task_id,),
         daemon=True,
     )
     thread.start()
