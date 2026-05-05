@@ -382,13 +382,14 @@
         <input type="text" id="skip-dates" placeholder="Select multiple dates..." />
       </div>
 
-      <div class="full checkbox-row" style="display: flex; gap: 24px; align-items: center; margin-top: -4px; margin-bottom: 8px;">
+      <div class="full checkbox-row" style="display: flex; gap: 24px; align-items: center; margin-top: -4px; margin-bottom: 8px; flex-wrap: wrap;">
         <label style="display: flex; align-items: center; gap: 8px; font-weight: 500; cursor: pointer; color: var(--text); font-size: 0.9rem;">
           <input type="checkbox" id="include-saturdays" style="width: auto; margin: 0; cursor: pointer;"> Include Saturdays
         </label>
         <label style="display: flex; align-items: center; gap: 8px; font-weight: 500; cursor: pointer; color: var(--text); font-size: 0.9rem;">
           <input type="checkbox" id="include-sundays" style="width: auto; margin: 0; cursor: pointer;"> Include Sundays
         </label>
+        <div id="calculated-days" style="margin-left: auto; font-size: 0.9rem; font-weight: 600; color: var(--accent); background: rgba(255,255,255,0.05); border: 1px solid var(--border); padding: 4px 12px; border-radius: 6px; display: none;"></div>
       </div>
 
       <div>
@@ -466,7 +467,7 @@
         </div>
       </div>
 
-      <div class="full">
+      <div class="full" style="margin-top: 32px;">
         <div style="display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 5px;">
           <label for="work-desc" style="margin-bottom: 0;">Daily Work Log <span style="color:var(--muted);font-weight:400">(Markdown Format)</span></label>
           <a href="javascript:void(0)" onclick="copyTemplateFormat(this)" style="font-size: 0.82rem; color: var(--accent); text-decoration: none; font-weight: 600; padding: 4px 8px; border: 1px solid var(--border); border-radius: 4px; background: rgba(255,255,255,0.05); transition: all 0.2s;">📋 Copy Example Format</a>
@@ -556,6 +557,69 @@
 <script>
   // ── State ──
   let currentTaskId = null;
+
+  function updateCalculatedDays() {
+    const startVal = document.getElementById('start-date').value;
+    const endVal = document.getElementById('end-date').value;
+    const display = document.getElementById('calculated-days');
+    
+    if (!startVal || !endVal) {
+      display.style.display = 'none';
+      return;
+    }
+    
+    const start = new Date(startVal);
+    const end = new Date(endVal);
+    if (end < start) {
+      display.style.display = 'block';
+      display.textContent = 'Invalid Range';
+      display.style.color = 'var(--error)';
+      return;
+    }
+    
+    const incSat = document.getElementById('include-saturdays').checked;
+    const incSun = document.getElementById('include-sundays').checked;
+    
+    const skipVal = document.getElementById('skip-dates').value;
+    const skipSet = new Set();
+    if (skipVal) {
+      skipVal.split(',').forEach(s => {
+        const d = new Date(s.trim());
+        if (!isNaN(d)) skipSet.add(d.toISOString().split('T')[0]);
+      });
+    }
+    
+    let count = 0;
+    let current = new Date(start);
+    while (current <= end) {
+      const day = current.getDay(); // 0 = Sunday, 6 = Saturday
+      const dateStr = current.toISOString().split('T')[0];
+      
+      let isWeekend = false;
+      if (day === 6 && !incSat) isWeekend = true;
+      if (day === 0 && !incSun) isWeekend = true;
+      
+      if (!isWeekend && !skipSet.has(dateStr)) {
+        count++;
+      }
+      current.setDate(current.getDate() + 1);
+    }
+    
+    display.style.display = 'block';
+    display.textContent = count + (count === 1 ? ' Working Day' : ' Working Days');
+    display.style.color = 'var(--accent)';
+  }
+
+  document.addEventListener('DOMContentLoaded', () => {
+    const triggers = ['start-date', 'end-date', 'include-saturdays', 'include-sundays', 'skip-dates'];
+    triggers.forEach(id => {
+      const el = document.getElementById(id);
+      if (el) {
+        el.addEventListener('change', updateCalculatedDays);
+        el.addEventListener('input', updateCalculatedDays);
+      }
+    });
+  });
   let currentApiKey = null;
   let pollInterval = null;
 
