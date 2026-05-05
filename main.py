@@ -1,6 +1,9 @@
-import io
 import os
 import sys
+# Add parent directory to path so we can import gemini_helper and pdf_filler
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import io
 import uuid
 import threading
 import tempfile
@@ -17,7 +20,7 @@ from dateutil.parser import parse as parse_date
 import PyPDF2
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from gemini_helper import split_work_into_days, generate_journal_entry, generate_all_journals, parse_structured_entry, parse_multi_day_text
+from gemini_helper import parse_structured_entry, parse_multi_day_text
 from pdf_filler import fill_pdf_with_overlay
 
 # Set temp directory for Vercel
@@ -302,9 +305,7 @@ async def upload(
         if daily_work:
             print(f"[Upload] Parsed {len(daily_work)} days directly from structured text (no AI)")
         else:
-            # Fallback: Split work into days via AI
-            print(f"[Upload] No structured format detected, using AI to split work into days")
-            daily_work = split_work_into_days(api_key, work_description, working_days, num_days)
+            return JSONResponse(status_code=400, content={"error": "The provided text does not follow the required Markdown structure. Please click the 'Copy Example Format' button and format your text."})
 
         task_id = str(uuid.uuid4())
         tasks[task_id] = {
