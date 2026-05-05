@@ -563,8 +563,12 @@
     const endVal = document.getElementById('end-date').value;
     const display = document.getElementById('calculated-days');
     
+    const defaultPlaceholder = "Paste your formatted daily markdown here. Ensure you follow the correct Day headings and required fields...";
+    const workDesc = document.getElementById('work-desc');
+
     if (!startVal || !endVal) {
       display.style.display = 'none';
+      if (workDesc) workDesc.placeholder = defaultPlaceholder;
       return;
     }
     
@@ -574,6 +578,7 @@
       display.style.display = 'block';
       display.textContent = 'Invalid Range';
       display.style.color = 'var(--error)';
+      if (workDesc) workDesc.placeholder = defaultPlaceholder;
       return;
     }
     
@@ -608,6 +613,16 @@
     display.style.display = 'block';
     display.textContent = count + (count === 1 ? ' Working Day' : ' Working Days');
     display.style.color = 'var(--accent)';
+
+    if (workDesc) {
+      if (count > 75) {
+        workDesc.placeholder = `You have selected ${count} working days, but the PDF template only has space for 75 days. Please paste your formatted daily markdown here for up to 75 days...`;
+      } else if (count > 0) {
+        workDesc.placeholder = `Paste your formatted daily markdown here for the ${count} selected working day${count === 1 ? '' : 's'}. Ensure you follow the correct Day headings and required fields...`;
+      } else {
+        workDesc.placeholder = defaultPlaceholder;
+      }
+    }
   }
 
   document.addEventListener('DOMContentLoaded', () => {
