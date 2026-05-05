@@ -33,11 +33,11 @@ def parse_structured_entry(work_text: str) -> dict:
     # **MY SPACE:**
     # ### MY SPACE
     field_headers = [
-        ("my_space",             r"(?:^|\n)\s*(?:#{1,6}\s+|\*{0,2}\s*)MY\s*SPACE[^\n:]*\*{0,2}\s*:?"),
-        ("tasks_carried_out",    r"(?:^|\n)\s*(?:#{1,6}\s+|\*{0,2}\s*)Tasks?\s*Carried\s*Out[^\n:]*\*{0,2}\s*:?"),
-        ("key_learnings",        r"(?:^|\n)\s*(?:#{1,6}\s+|\*{0,2}\s*)Key\s*Learnings?[^\n:]*\*{0,2}\s*:?"),
-        ("tools_used",           r"(?:^|\n)\s*(?:#{1,6}\s+|\*{0,2}\s*)Tools?[\s,/]*(?:Equipment|Technology|Technologies|Techniques|Used)[^\n:]*\*{0,2}\s*:?"),
-        ("special_achievements", r"(?:^|\n)\s*(?:#{1,6}\s+|\*{0,2}\s*)Special\s*Achievements?[^\n:]*\*{0,2}\s*:?"),
+        ("my_space",             r"(?:^|\n)\s*(?:#{1,6}\s+|\*{0,2}\s*)MY\s*SPACE[^\n:]*:?\s*\*{0,2}\s*"),
+        ("tasks_carried_out",    r"(?:^|\n)\s*(?:#{1,6}\s+|\*{0,2}\s*)Tasks?\s*Carried\s*Out[^\n:]*:?\s*\*{0,2}\s*"),
+        ("key_learnings",        r"(?:^|\n)\s*(?:#{1,6}\s+|\*{0,2}\s*)Key\s*Learnings?[^\n:]*:?\s*\*{0,2}\s*"),
+        ("tools_used",           r"(?:^|\n)\s*(?:#{1,6}\s+|\*{0,2}\s*)Tools?[\s,/]*(?:Equipment|Technology|Technologies|Techniques|Used)[^\n:]*:?\s*\*{0,2}\s*"),
+        ("special_achievements", r"(?:^|\n)\s*(?:#{1,6}\s+|\*{0,2}\s*)Special\s*Achievements?[^\n:]*:?\s*\*{0,2}\s*"),
     ]
 
     # Find all field positions
@@ -164,4 +164,187 @@ def format_date(date_str: str) -> str:
         return date_str
 
 
-# Removed legacy AI processing endpoints. System is now fully offline via Regex parsers above.
+# ─────────────────────────────────────────────
+# ✅ SAFE OPENROUTER CALL (handles 429)
+# ─────────────────────────────────────────────
+def call_openrouter(api_key, prompt, retries=3):
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "http://localhost:8000", # Required by OpenRouter
+        "X-Title": "OJT Journal Maker" # Required by OpenRouter
+    }
+    data = {
+        "model": OPENROUTER_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.4,
+        "top_p": 0.9,
+        "max_tokens": 4000,
+    }
+
+    for i in range(retries):
+        try:
+            req = urllib.request.Request(url, data=json.dumps(data).encode('utf-8'), headers=headers)
+            with urllib.request.urlopen(req) as response:
+                response_data = json.loads(response.read().decode('utf-8'))
+                
+                text = response_data['choices'][0]['message']['content'].strip()
+                # Remove markdown code fences (```json ... ``` or ``` ... ```)
+                text = re.sub(r'^```(?:json)?\s*\n?', '', text, flags=re.MULTILINE)
+                text = re.sub(r'\n?\s*```\s*$', '', text, flags=re.MULTILINE)
+                # Remove any text before the first [ or {
+                json_start = None
+                for idx, ch in enumerate(text):
+                    if ch in '[{':
+                        json_start = idx
+                        break
+                if json_start is not None:
+                    text = text[json_start:]
+                # Remove any text after the last ] or }
+                json_end = None
+                for idx in range(len(text) - 1, -1, -1):
+                    if text[idx] in ']}':
+                        json_end = idx
+                        break
+                if json_end is not None:
+                    text = text[:json_end + 1]
+                # Remove backtick characters inside strings (e.g. `npx create-next-app`)
+                text = text.replace('`', '')
+                return text
+
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                time.sleep(5) # Wait before retry
+            else:
+                error_body = e.read().decode()
+                raise Exception(f"OpenRouter Error {e.code}: {error_body}")
+        except Exception as e:
+            if "429" in str(e):
+                time.sleep(5)
+            else:
+                raise e
+    raise Exception("OpenRouter API failed after retries")
+
+
+# ─────────────────────────────────────────────
+# ✅ SPLIT WORK INTO DAYS
+# ─────────────────────────────────────────────
+def split_work_into_days(api_key: str, work_description: str, dates: list, num_days: int) -> list:
+    prompt = f"""
+You are a professional OJT training supervisor.
+
+Divide the following work into EXACTLY {num_days} day-wise entries.
+
+RULES:
+- No HR / meetings / company talk
+- Only technical/project work
+- Each day must be unique
+- Maintain progression:
+  understanding → planning → implementation → debugging → improvement
+- Each day: 2–4 meaningful sentences
+- No generic phrases
+- No repetition
+- No empty or incomplete entries
+- Use college/student-level tools (avoid professional tools like Jira, Azure, enterprise software)
+
+OUTPUT JSON ONLY:
+[
+  {{ "day": 1, "work": "..." }}
+]
+
+WORK:
+{work_description}
+"""
+
+    text = call_openrouter(api_key, prompt)
+    daily_splits = json.loads(text)
+
+    result = []
+    for i, item in enumerate(daily_splits[:num_days]):
+        formatted_date = format_date(dates[i]) if i < len(dates) else ""
+        result.append({
+            "day": i + 1,
+            "date": formatted_date,
+            "work": item["work"]
+        })
+
+    return result
+
+
+# ─────────────────────────────────────────────
+# ✅ GENERATE ALL JOURNAL ENTRIES IN ONE CALL 🚀
+# ─────────────────────────────────────────────
+def generate_all_journals(api_key: str, daily_data: list) -> list:
+    combined_input = "\n".join([
+        f"Day {d['day']} ({d['date']}): {d['work']}"
+        for d in daily_data
+    ])
+
+    prompt = f"""
+Generate professional OJT daily journal entries for college students.
+
+RULES:
+- Each day must be unique
+- No repetition
+- No HR/company content
+- Keep concise and realistic
+- Avoid professional/enterprise tools (no Jira, Azure, Salesforce, etc.)
+- Use college-friendly tools: Python, JavaScript, Git, SQL, VS Code, Linux, React, etc.
+
+For EACH day return:
+- my_space: Minimum 4 lines of detailed personal reflection
+- tasks_carried_out: List items separated by NEWLINE (NOT array)
+- key_learnings: List items separated by NEWLINE (NOT array)
+- tools_used: comma-separated list
+- special_achievements: 1-2 lines (NEVER "N/A")
+
+OUTPUT JSON (use plain text with newlines for multi-line fields):
+[
+  {{
+    "day": 1,
+    "my_space": "reflection text",
+    "tasks_carried_out": "Task 1\\nTask 2\\nTask 3",
+    "key_learnings": "Learning 1\\nLearning 2",
+    "tools_used": "tool1, tool2, tool3",
+    "special_achievements": "achievement text"
+  }}
+]
+
+INPUT:
+{combined_input}
+"""
+
+    text = call_openrouter(api_key, prompt)
+    return json.loads(text)
+
+
+# ─────────────────────────────────────────────
+# ✅ SINGLE JOURNAL ENTRY (for backward compatibility)
+# ─────────────────────────────────────────────
+def generate_journal_entry(api_key: str, date: str, work: str) -> dict:
+    formatted_date = format_date(date)
+
+    prompt = f"""Generate a professional internship daily journal entry for a college student.
+
+Date: {formatted_date}
+Work Done: {work}
+
+Return ONLY a valid JSON object (no markdown, no explanation):
+{{
+  "my_space": "Detailed personal reflection (Minimum 4 sentences/lines)",
+  "tasks_carried_out": "Task 1\\nTask 2\\nTask 3\\nTask 4",
+  "key_learnings": "Learning 1\\nLearning 2\\nLearning 3",
+  "tools_used": "tool1, tool2, tool3",
+  "special_achievements": "Achievement description (1-2 sentences)"
+}}
+
+IMPORTANT:
+- Use college/student-level tools only (Python, JavaScript, Git, VS Code, Linux, React, etc.)
+- AVOID professional tools like Jira, Azure, Salesforce, enterprise software
+- Use plain newlines (\\n) between items for multi-line fields, NOT JSON arrays
+- Each task/learning should be a complete sentence
+- Keep it concise, professional, realistic, and non-repetitive"""
+
+    text = call_openrouter(api_key, prompt)
+    return json.loads(text)

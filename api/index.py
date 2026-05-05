@@ -1,4 +1,3 @@
-# Trigger Vercel Build - Premium UI v2
 import os
 import sys
 # Add parent directory to path so we can import gemini_helper and pdf_filler
